@@ -732,23 +732,20 @@ void Server::AsyncRunStep(float dtime, bool initial_step)
 
 		// Step environment
 		m_env->step(dtime);
-	}
 
-	static const float map_timer_and_unload_dtime = 2.92;
-	if(m_map_timer_and_unload_interval.step(dtime, map_timer_and_unload_dtime))
-	{
-		EnvAutoLock lock(this);
 		// Run Map's timers and unload unused data
-		ScopeProfiler sp(g_profiler, "Server: map timer and unload");
-		m_env->getMap().timerUpdate(map_timer_and_unload_dtime,
-			std::max(g_settings->getFloat("server_unload_unused_data_timeout"), 0.0f),
-			-1);
-	}
+		constexpr float map_timer_and_unload_dtime = 2.95f;
+		auto &map = m_env->getServerMap();
+		if (m_map_timer_and_unload_interval.step(dtime, map_timer_and_unload_dtime)) {
+			ScopeProfiler sp(g_profiler, "Server: map timer and unload");
+			map.timerUpdate(map_timer_and_unload_dtime,
+				std::max(g_settings->getFloat("server_unload_unused_data_timeout"), 0.0f),
+				-1);
+		}
 
-	/*
-		Note: Orphan MapBlock ptrs become dangling after this call.
-	*/
-	m_env->getServerMap().step();
+		// Note: Orphan MapBlock pointers become dangling after this call
+		map.step();
+	}
 
 	/*
 		Listen to the admin chat, if available
@@ -1263,7 +1260,13 @@ PlayerSAO *Server::StageTwoClientInit(session_t peer_id)
 
 	/* Add object to environment */
 	PlayerSAO *playersao = sao.get();
-	m_env->addActiveObject(std::move(sao));
+	if (m_env->addActiveObject(std::move(sao)) == 0) {
+		actionstream << "Server: Can't add SAO for player \"" << playername
+			<< "\"." << std::endl;
+		DenyAccess(peer_id, SERVER_ACCESSDENIED_SERVER_FAIL);
+		m_env->removePlayer(player);
+		return nullptr;
+	}
 
 	if (playersao->isNewPlayer())
 		m_script->on_newplayer(playersao);
@@ -1279,8 +1282,9 @@ PlayerSAO *Server::StageTwoClientInit(session_t peer_id)
 	// Send inventory formspec
 	SendPlayerInventoryFormspec(peer_id);
 
-	// Send inventory
+	// Send inventories
 	SendInventory(player, false);
+	sendDetachedInventories(peer_id);
 
 	// Send HP
 	SendPlayerHP(playersao, false);
@@ -1305,6 +1309,7 @@ PlayerSAO *Server::StageTwoClientInit(session_t peer_id)
 			actionstream << name << " ";
 		actionstream << player->getName() << std::endl;
 	}
+
 	return playersao;
 }
 
@@ -3023,19 +3028,43 @@ void Server::sendDetachedInventory(Inventory *inventory, const std::string &name
 		Send(&pkt);
 }
 
-void Server::sendDetachedInventories(session_t peer_id, bool incremental)
+void Server::sendDetachedInventories(session_t peer_id)
 {
-	// Lookup player name, to filter detached inventories just after
-	std::string peer_name;
-	if (peer_id != PEER_ID_INEXISTENT) {
-		peer_name = getClient(peer_id, CS_Created)->getName();
+	if (peer_id == PEER_ID_INEXISTENT) {
+		assert(false);
+		return;
 	}
 
-	auto send_cb = [this, peer_id](const std::string &name, Inventory *inv) {
+	std::string peer_name = getClient(peer_id, CS_Created)->getName();
+
+	auto send_cb = [&] (const std::string &name, Inventory *inv, const std::string &owner) {
+		// don't send what we don't own
+		if (!owner.empty() && owner != peer_name)
+			return;
+
+		assert(inv);
 		sendDetachedInventory(inv, name, peer_id);
 	};
 
-	m_inventory_mgr->sendDetachedInventories(peer_name, incremental, send_cb);
+	m_inventory_mgr->sendDetachedInventories(peer_name, false, send_cb);
+}
+
+void Server::sendDetachedInventories()
+{
+	auto send_cb = [this] (const std::string &name, Inventory *inv, const std::string &owner) {
+		session_t peer_id = PEER_ID_INEXISTENT;
+		if (!owner.empty()) {
+			auto *player = m_env->getPlayer(owner);
+			peer_id = player ? player->getPeerId() : PEER_ID_INEXISTENT;
+			if (peer_id == PEER_ID_INEXISTENT)
+				return; // owner is not online; skip
+		}
+
+		assert(inv);
+		sendDetachedInventory(inv, name, peer_id);
+	};
+
+	m_inventory_mgr->sendDetachedInventories("", true, send_cb);
 }
 
 /*
@@ -3111,6 +3140,7 @@ void Server::acceptAuth(session_t peer_id, bool forSudoMode)
 
 void Server::DeleteClient(session_t peer_id, ClientDeletionReason reason)
 {
+	EnvAutoLock envlock(this);
 	std::wstring message;
 	{
 		/*
@@ -3174,10 +3204,8 @@ void Server::DeleteClient(session_t peer_id, ClientDeletionReason reason)
 						new ChatEventNick(CET_NICK_REMOVE, name));
 			}
 		}
-		{
-			EnvAutoLock envlock(this);
-			m_clients.DeleteClient(peer_id);
-		}
+
+		m_clients.DeleteClient(peer_id);
 	}
 
 	// Send leave chat message to all remaining clients
